@@ -1,45 +1,53 @@
-import argparse
+import sys
 import socket
+import struct
+import zlib
 
-from utils import PacketHeader, compute_checksum
+START = 0
+END = 1
+DATA = 2
+ACK = 3
+HEADER_SIZE = 16
 
+def verify_packet(packet):
+    if len(packet) < HEADER_SIZE: return False, None, None, None, None
+    header, data = packet[:HEADER_SIZE], packet[HEADER_SIZE:]
+    pkt_type, seq_num, length, checksum_received = struct.unpack('!IIII', header)
+    checksum_calculated = zlib.crc32(struct.pack('!III', pkt_type, seq_num, length) + data) & 0xffffffff
+    if checksum_calculated != checksum_received: return False, None, None, None, None
+    return True, pkt_type, seq_num, length, data
 
-def receiver(receiver_ip, receiver_port, window_size):
-    """TODO: Listen on socket and print received message to sys.stdout."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((receiver_ip, receiver_port))
-    while True:
-        # Receive packet; address includes both IP and port
-        pkt, address = s.recvfrom(2048)
-
-        # Extract header and payload
-        pkt_header = PacketHeader(pkt[:16])
-        msg = pkt[16 : 16 + pkt_header.length]
-
-        # Verity checksum
-        pkt_checksum = pkt_header.checksum
-        pkt_header.checksum = 0
-        computed_checksum = compute_checksum(pkt_header / msg)
-        if pkt_checksum != computed_checksum:
-            print("checksums not match")
-        print(msg)
-
+def create_ack(ack_seq):
+    return struct.pack('!IIII', ACK, ack_seq, 0, zlib.crc32(struct.pack('!III', ACK, ack_seq, 0)) & 0xffffffff)
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "receiver_ip", help="The IP address of the host that receiver is running on"
-    )
-    parser.add_argument(
-        "receiver_port", type=int, help="The port number on which receiver is listening"
-    )
-    parser.add_argument(
-        "window_size", type=int, help="Maximum number of outstanding packets"
-    )
-    args = parser.parse_args()
+    if len(sys.argv) != 4: sys.exit(1)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((sys.argv[1], int(sys.argv[2])))
+    window_size = int(sys.argv[3])
+    
+    expected_seq, buffer, started = 1, {}, False
+    while True:
+        packet, addr = sock.recvfrom(2048)
+        is_valid, pkt_type, seq_num, length, data = verify_packet(packet)
+        if not is_valid: continue
 
-    receiver(args.receiver_ip, args.receiver_port, args.window_size)
-
+        if pkt_type == START:
+            started = True
+            sock.sendto(create_ack(1), addr)
+        elif pkt_type == DATA and started:
+            if seq_num < expected_seq + window_size and seq_num >= expected_seq:
+                buffer[seq_num] = data
+                sock.sendto(create_ack(seq_num), addr) 
+            while expected_seq in buffer:
+                sys.stdout.buffer.write(buffer[expected_seq])
+                sys.stdout.flush()
+                del buffer[expected_seq]
+                expected_seq += 1
+        elif pkt_type == END and started:
+            sock.sendto(create_ack(seq_num + 1), addr)
+            break
+    sock.close()
 
 if __name__ == "__main__":
     main()
